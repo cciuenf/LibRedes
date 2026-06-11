@@ -1,337 +1,171 @@
-/* Necessário para getaddrinfo/freeaddrinfo/struct addrinfo com -std=c11 */
-#define _POSIX_C_SOURCE 200112L
+#ifndef LIBPHYSICAL_H
+#define LIBPHYSICAL_H
 
 /*
- * libphysical.c — implementação da API do meio físico simulado
+ * libphysical — API do meio físico simulado
+ * Projeto TCP/IP do Zero — Capture the Flag
  *
- * Protocolo UDP (big-endian):
- *   HELLO     [0x01][group_id: 16 bytes, null-padded]
- *   HELLO_ACK [0x02][mac: 6 bytes][virtual_ip: 4 bytes, network byte order]
- *   DATA      [0x03][dst_ip: 4 bytes, network byte order][payload: N bytes]
- *   DELIVER   [0x04][src_ip: 4 bytes, network byte order][payload: N bytes]
- *   MEDIUM    [0x05]
- *   MEDIUM_OK [0x06][free: 1 byte]
- *   PING      [0x07]
- *   PONG      [0x08][rtt_hint: 2 bytes, microssegundos]
- *   BYE       [0x09]
- *   ERROR     [0xFF][msg: N bytes UTF-8]
+ * Esta biblioteca abstrai o protocolo UDP entre o seu programa
+ * e o nó central (physical_medium). Você não precisa se preocupar
+ * com sockets — apenas com o que enviar e o que receber.
  *
- * Convenção de byte order nesta lib:
- *   - Tudo que entra e sai pela API pública está em HOST byte order.
- *   - A conversão para/de network byte order acontece aqui dentro.
- *   - PHY_SERVER_IP e phy_virtual_ip() retornam host byte order.
+ * ── Byte order ────────────────────────────────────────────────────────────────
+ * Todas as funções desta API usam HOST byte order (o padrão do seu programa).
+ * A conversão para network byte order acontece dentro da lib — você não precisa
+ * chamar htonl/ntohl em nenhum dos argumentos ou retornos aqui.
+ *
+ * Exemplos corretos:
+ *   phy_send(h, PHY_SERVER_IP, data, len);           // OK — constante já em host order
+ *   phy_send(h, phy_virtual_ip(h), data, len);       // OK — retorno já em host order
+ *
+ * Exemplos ERRADOS (não faça isso):
+ *   phy_send(h, htonl(PHY_SERVER_IP), data, len);   // ERRADO — converte duas vezes
+ *
+ * ── Uso básico ────────────────────────────────────────────────────────────────
+ *
+ *   PhysicalHandle *h = phy_connect("grupo_a", "10.0.1.100", 9000);
+ *   if (!h) { perror("connect"); exit(1); }
+ *
+ *   uint8_t mac[6];
+ *   phy_mac_addr(h, mac);
+ *   printf("Meu MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+ *          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+ *
+ *   // Diagnóstico: mede RTT com o nó central
+ *   long rtt = phy_ping(h);
+ *   if (rtt >= 0) printf("RTT: %ld µs\n", rtt);
+ *
+ *   // CSMA/CA: verifica se o meio está livre antes de transmitir
+ *   while (phy_medium_free(h) != 1)
+ *       usleep(10000);
+ *
+ *   // Envia bytes brutos para o servidor (10.0.0.1)
+ *   uint8_t payload[] = "oi servidor";
+ *   phy_send(h, PHY_SERVER_IP, payload, sizeof(payload) - 1);
+ *
+ *   // Recebe resposta (timeout de 3 s)
+ *   uint32_t src_ip;
+ *   uint8_t buf[4096];
+ *   ssize_t n = phy_recv(h, &src_ip, buf, sizeof(buf), 3000);
+ *   if (n > 0) printf("Recebido: %.*s\n", (int)n, buf);
+ *
+ *   phy_disconnect(h);
  */
 
-#include "libphysical.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <time.h>
-#include <unistd.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/* ---- tipos de mensagem ---- */
-#define MSG_HELLO     0x01
-#define MSG_HELLO_ACK 0x02
-#define MSG_DATA      0x03
-#define MSG_DELIVER   0x04
-#define MSG_MEDIUM    0x05
-#define MSG_MEDIUM_OK 0x06
-#define MSG_PING      0x07
-#define MSG_PONG      0x08
-#define MSG_BYE       0x09
-#define MSG_ERROR     0xFF
+/* Handle opaco — não acesse os campos internamente. */
+typedef struct PhysicalHandle PhysicalHandle;
 
-#define MAX_GROUP_ID  16
-#define RECV_BUF_SIZE 2048   /* MTU simulado + cabeçalhos; evita 64KB no stack */
-
-struct PhysicalHandle {
-    int                  sock;
-    struct sockaddr_in   server_addr;
-    uint8_t              mac[6];
-    uint32_t             virtual_ip;   /* HOST byte order */
-    char                 group_id[MAX_GROUP_ID + 1];
-};
-
-/* ---- helpers internos ---- */
-
-static int set_recv_timeout(int sock, int ms) {
-    struct timeval tv;
-    tv.tv_sec  = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
-    return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-}
-
-static int clear_recv_timeout(int sock) {
-    struct timeval tv = {0, 0};
-    return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-}
-
-static ssize_t udp_send(struct PhysicalHandle *h, const uint8_t *buf, size_t len) {
-    return sendto(h->sock, buf, len, 0,
-                  (struct sockaddr *)&h->server_addr, sizeof(h->server_addr));
-}
-
-static ssize_t udp_recv(struct PhysicalHandle *h, uint8_t *buf, size_t len) {
-    return recv(h->sock, buf, len, 0);
-}
-
-/* Retorna tempo monotônico em milissegundos. */
-static long now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)(ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
-}
-
-/* ---- handshake HELLO ---- */
-
-static int do_hello(struct PhysicalHandle *h) {
-    uint8_t pkt[1 + MAX_GROUP_ID];
-    memset(pkt, 0, sizeof(pkt));
-    pkt[0] = MSG_HELLO;
-    strncpy((char *)pkt + 1, h->group_id, MAX_GROUP_ID);
-
-    uint8_t buf[64];
-    int attempts = 3;
-
-    while (attempts-- > 0) {
-        if (udp_send(h, pkt, sizeof(pkt)) < 0) {
-            perror("phy_connect: sendto HELLO");
-            return -1;
-        }
-
-        set_recv_timeout(h->sock, 2000);
-        ssize_t n = udp_recv(h, buf, sizeof(buf));
-        clear_recv_timeout(h->sock);
-
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                fprintf(stderr, "phy_connect: timeout aguardando HELLO_ACK (tentativa %d)\n",
-                        3 - attempts);
-                continue;
-            }
-            perror("phy_connect: recv HELLO_ACK");
-            return -1;
-        }
-
-        if (n < 11 || buf[0] != MSG_HELLO_ACK) {
-            fprintf(stderr, "phy_connect: resposta inesperada (type=0x%02X)\n", buf[0]);
-            return -1;
-        }
-
-        memcpy(h->mac, buf + 1, 6);
-
-        uint32_t ip_net;
-        memcpy(&ip_net, buf + 7, 4);
-        h->virtual_ip = ntohl(ip_net);   /* armazena em host byte order */
-        return 0;
-    }
-
-    fprintf(stderr, "phy_connect: nó central não respondeu após 3 tentativas\n");
-    return -1;
-}
-
-/* ---- API pública ---- */
-
-PhysicalHandle *phy_connect(const char *group_id, const char *host, uint16_t port) {
-    if (!group_id || strlen(group_id) == 0) {
-        fprintf(stderr, "phy_connect: group_id não pode ser vazio\n");
-        return NULL;
-    }
-    if (strlen(group_id) > MAX_GROUP_ID) {
-        fprintf(stderr, "phy_connect: group_id muito longo (max %d)\n", MAX_GROUP_ID);
-        return NULL;
-    }
-
-    struct PhysicalHandle *h = calloc(1, sizeof(*h));
-    if (!h) return NULL;
-
-    strncpy(h->group_id, group_id, MAX_GROUP_ID);
-
-    /* Resolve hostname */
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    int rc = getaddrinfo(host, NULL, &hints, &res);
-    if (rc != 0) {
-        fprintf(stderr, "phy_connect: getaddrinfo(%s): %s\n", host, gai_strerror(rc));
-        free(h);
-        return NULL;
-    }
-    h->server_addr = *(struct sockaddr_in *)res->ai_addr;
-    h->server_addr.sin_port = htons(port);
-    freeaddrinfo(res);
-
-    /* Cria socket UDP */
-    h->sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (h->sock < 0) {
-        perror("phy_connect: socket");
-        free(h);
-        return NULL;
-    }
-
-    /* Bind em porta aleatória */
-    struct sockaddr_in local = {0};
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = INADDR_ANY;
-    local.sin_port = 0;
-    if (bind(h->sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
-        perror("phy_connect: bind");
-        close(h->sock);
-        free(h);
-        return NULL;
-    }
-
-    if (do_hello(h) < 0) {
-        close(h->sock);
-        free(h);
-        return NULL;
-    }
-
-    return h;
-}
-
-void phy_mac_addr(PhysicalHandle *h, uint8_t mac_out[6]) {
-    if (h) memcpy(mac_out, h->mac, 6);
-}
-
-/* Retorna host byte order — use htonl() se precisar colocar num pacote. */
-uint32_t phy_virtual_ip(PhysicalHandle *h) {
-    return h ? h->virtual_ip : 0;
-}
-
-int phy_medium_free(PhysicalHandle *h) {
-    if (!h) return -1;
-
-    uint8_t pkt = MSG_MEDIUM;
-    if (udp_send(h, &pkt, 1) < 0) return -1;
-
-    uint8_t buf[4];
-    set_recv_timeout(h->sock, 500);
-    ssize_t n = udp_recv(h, buf, sizeof(buf));
-    clear_recv_timeout(h->sock);
-
-    if (n < 2 || buf[0] != MSG_MEDIUM_OK) return -1;
-    return (buf[1] == 0x01) ? 1 : 0;
-}
+/* IP virtual do servidor de flags na rede simulada: 10.0.0.1 (host byte order). */
+#define PHY_SERVER_IP  0x0A000001u
 
 /*
- * phy_send — dst_ip em HOST byte order (igual ao retorno de phy_virtual_ip e PHY_SERVER_IP).
- * A conversão para network byte order é feita internamente.
+ * phy_connect — conecta ao nó central e registra o grupo.
+ *
+ * group_id : identificador único do grupo (ex: "grupo_a"), máx 16 chars
+ * host     : IP ou hostname do nó central
+ * port     : porta UDP do nó central (normalmente 9000)
+ *
+ * Retorna um handle em sucesso, NULL em erro.
+ * Após conectar, phy_mac_addr(), phy_virtual_ip() e phy_ping() estão disponíveis.
  */
-int phy_send(PhysicalHandle *h, uint32_t dst_ip, const uint8_t *data, size_t len) {
-    if (!h || !data) return -1;
-
-    uint8_t *pkt = malloc(1 + 4 + len);
-    if (!pkt) return -1;
-
-    uint32_t dst_net = htonl(dst_ip);   /* host → network byte order */
-
-    pkt[0] = MSG_DATA;
-    memcpy(pkt + 1, &dst_net, 4);
-    memcpy(pkt + 5, data, len);
-
-    ssize_t sent = udp_send(h, pkt, 1 + 4 + len);
-    free(pkt);
-    return (sent < 0) ? -1 : 0;
-}
+PhysicalHandle *phy_connect(const char *group_id,
+                             const char *host,
+                             uint16_t    port);
 
 /*
- * phy_recv — src_ip é preenchido em HOST byte order.
- *
- * Correção de timeout: usa clock monotônico para recalcular o tempo restante
- * a cada pacote de controle descartado, evitando retorno prematuro.
+ * phy_mac_addr — copia o MAC virtual de 6 bytes para mac_out.
+ * Use este MAC como endereço de origem em quadros IEEE 802.
+ * mac_out deve ter ao menos 6 bytes.
  */
-ssize_t phy_recv(PhysicalHandle *h, uint32_t *src_ip, uint8_t *buf, size_t buf_len,
-                 int timeout_ms) {
-    if (!h || !buf) return -1;
-
-    static uint8_t tmp[RECV_BUF_SIZE];   /* static: evita 2KB no stack a cada chamada */
-
-    long deadline = 0;
-    if (timeout_ms > 0) deadline = now_ms() + timeout_ms;
-
-    for (;;) {
-        /* Recalcula tempo restante a cada iteração (pacotes descartados consomem tempo). */
-        if (timeout_ms > 0) {
-            long remaining = deadline - now_ms();
-            if (remaining <= 0) return 0;   /* timeout */
-            set_recv_timeout(h->sock, (int)remaining);
-        }
-
-        ssize_t n = udp_recv(h, tmp, sizeof(tmp));
-
-        if (n < 0) {
-            clear_recv_timeout(h->sock);
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; /* timeout */
-            return -1;
-        }
-
-        if (n < 1) continue;
-        if (tmp[0] != MSG_DELIVER) continue; /* descarta controle (MEDIUM_OK, PONG, etc.) */
-        if (n < 5) continue;
-
-        uint32_t ip_net;
-        memcpy(&ip_net, tmp + 1, 4);
-        if (src_ip) *src_ip = ntohl(ip_net);   /* network → host byte order */
-
-        size_t payload_len = (size_t)(n - 5);
-        if (payload_len > buf_len) payload_len = buf_len;
-        memcpy(buf, tmp + 5, payload_len);
-
-        if (timeout_ms > 0) clear_recv_timeout(h->sock);
-        return (ssize_t)payload_len;
-    }
-}
+void phy_mac_addr(PhysicalHandle *h, uint8_t mac_out[6]);
 
 /*
- * phy_ping — mede o RTT até o nó central em microssegundos.
+ * phy_virtual_ip — retorna o IP virtual do grupo em HOST byte order.
+ * Exemplo de retorno: 0x0A000002 representa 10.0.0.2
  *
- * Envia MSG_PING e aguarda MSG_PONG. Retorna o RTT medido localmente em µs,
- * ou -1 em caso de erro/timeout (timeout fixo: 2 s).
- *
- * Útil para diagnosticar latência do meio simulado antes de transmitir.
+ * Se precisar colocar este valor dentro de um pacote na rede, use htonl():
+ *   uint32_t ip_para_pacote = htonl(phy_virtual_ip(h));
  */
-long phy_ping(PhysicalHandle *h) {
-    if (!h) return -1;
-
-    uint8_t pkt = MSG_PING;
-
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    if (udp_send(h, &pkt, 1) < 0) return -1;
-
-    uint8_t buf[8];
-    set_recv_timeout(h->sock, 2000);
-    ssize_t n = udp_recv(h, buf, sizeof(buf));
-    clear_recv_timeout(h->sock);
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    if (n < 1 || buf[0] != MSG_PONG) return -1;
-
-    long rtt_us = (long)((t1.tv_sec  - t0.tv_sec)  * 1000000L +
-                         (t1.tv_nsec - t0.tv_nsec) / 1000L);
-    return rtt_us;
-}
+uint32_t phy_virtual_ip(PhysicalHandle *h);
 
 /*
- * phy_disconnect — envia BYE ao nó central, fecha o socket e libera o handle.
+ * phy_ping — mede o RTT até o nó central.
  *
- * O BYE permite que o nó central libere o group_id imediatamente,
- * evitando recusa de reconexão em caso de crash + restart rápido.
+ * Envia um PING e aguarda o PONG. Útil para checar a latência do meio
+ * antes de calibrar timeouts nas camadas superiores.
+ *
+ * Retorna o RTT em microssegundos (µs), ou -1 em erro/timeout.
  */
-void phy_disconnect(PhysicalHandle *h) {
-    if (!h) return;
-    uint8_t bye = MSG_BYE;
-    udp_send(h, &bye, 1);   /* best-effort: ignora erro de envio */
-    close(h->sock);
-    free(h);
+long phy_ping(PhysicalHandle *h);
+
+/*
+ * phy_medium_free — consulta se o meio está livre (CSMA/CA).
+ *
+ * Retorna:
+ *    1  : meio livre, pode transmitir
+ *    0  : meio ocupado, aguarde e tente novamente
+ *   -1  : erro de comunicação com o nó central
+ *
+ * Chame esta função antes de cada phy_send() para implementar CSMA/CA.
+ */
+int phy_medium_free(PhysicalHandle *h);
+
+/*
+ * phy_send — envia bytes brutos para um IP virtual de destino.
+ *
+ * dst_ip : IP do destino em HOST byte order (use PHY_SERVER_IP ou phy_virtual_ip())
+ * data   : ponteiro para os dados — a lib não interpreta o conteúdo
+ * len    : número de bytes
+ *
+ * Retorna 0 em sucesso, -1 em erro.
+ */
+int phy_send(PhysicalHandle  *h,
+             uint32_t         dst_ip,
+             const uint8_t   *data,
+             size_t           len);
+
+/*
+ * phy_recv — recebe bytes do nó central.
+ *
+ * Bloqueia até chegar um pacote de dados ou o timeout esgotar.
+ * Pacotes de controle (MEDIUM_OK, PONG, etc.) são descartados automaticamente.
+ * O timeout é respeitado mesmo que muitos pacotes de controle cheguem antes.
+ *
+ * src_ip     : preenchido com o IP virtual de origem em HOST byte order
+ * buf        : buffer do chamador para os dados recebidos
+ * buf_len    : tamanho do buffer
+ * timeout_ms : timeout em milissegundos; 0 = bloqueio indefinido
+ *
+ * Retorna:
+ *   > 0  : número de bytes recebidos
+ *   = 0  : timeout esgotado sem dados
+ *   = -1 : erro (ver errno)
+ */
+ssize_t phy_recv(PhysicalHandle *h,
+                 uint32_t       *src_ip,
+                 uint8_t        *buf,
+                 size_t          buf_len,
+                 int             timeout_ms);
+
+/*
+ * phy_disconnect — encerra a conexão com o nó central e libera o handle.
+ *
+ * Envia um BYE ao nó central para liberar o group_id imediatamente.
+ * Isso evita recusa de reconexão se o programa reiniciar rapidamente.
+ * Após esta chamada, o handle não deve ser usado.
+ */
+void phy_disconnect(PhysicalHandle *h);
+
+#ifdef __cplusplus
 }
+#endif
+
+#endif /* LIBPHYSICAL_H */
