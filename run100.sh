@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# run100.sh — roda um exemplo 100 vezes e reporta estatísticas
+# run100.sh — executa um binário 100 vezes e reporta estatísticas
 #
-# Uso: bash run100.sh [-q] <diretório-do-exemplo>
-# Ex:  bash run100.sh Exemplos/flag_two
-#      bash run100.sh -q Exemplos/flag_one_b
+# Uso: bash run100.sh [-q] <binário>
+# Ex:  bash run100.sh ./flag_two
+#      bash run100.sh -q ./meu_programa
 
 set -o pipefail
 
 usage() {
-    echo "Uso: run100.sh [-q|--quiet] <diretório-do-exemplo>"
+    echo "Uso: run100.sh [-q|--quiet] <binário>"
     echo "  -q, --quiet   suprime saída individual, mostra só o resumo"
     exit 1
 }
 
 QUIET=0
-DIR=""
+BIN=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -q|--quiet) QUIET=1; shift ;;
         -*) echo "flag desconhecida: $1"; usage ;;
-        *)  [[ -z "$DIR" ]] && DIR="$1" || { echo "diretório já definido: $DIR (extra: $1)"; usage; }
+        *)  [[ -z "$BIN" ]] && BIN="$1" || { echo "binário já definido: $BIN (extra: $1)"; usage; }
             shift ;;
     esac
 done
 
-[[ -z "$DIR" ]] && usage
+[[ -z "$BIN" ]] && usage
 
-DIR=$(realpath "$DIR" 2>/dev/null || echo "$DIR")
-[[ ! -d "$DIR" ]] && { echo "erro: '$DIR' não é um diretório"; exit 1; }
-[[ ! -f "$DIR/go.mod" ]] && { echo "erro: '$DIR' não tem go.mod — não parece um exemplo Go"; exit 1; }
+BIN=$(realpath "$BIN" 2>/dev/null || echo "$BIN")
+[[ ! -f "$BIN" ]] && { echo "erro: '$BIN' não encontrado"; exit 1; }
+[[ ! -x "$BIN" ]] && { echo "erro: '$BIN' não é executável"; exit 1; }
 
 TOTAL=100
 OK=0
@@ -40,7 +40,6 @@ MAX_MS=0
 TOTAL_MS=0
 TIMEOUT_SEC=8
 
-# Detecta se temos GNU date (ms) ou BSD/macOS
 if date +%3N &>/dev/null; then
     now_ms() { echo $(( $(date +%s%3N) )); }
 else
@@ -48,7 +47,7 @@ else
 fi
 
 echo "════════════════════════════════════════════════════════"
-echo "  run100: $DIR × $TOTAL execuções"
+echo "  run100: $BIN × $TOTAL execuções"
 echo "  timeout: ${TIMEOUT_SEC}s  |  quiet: $QUIET"
 echo "════════════════════════════════════════════════════════"
 echo
@@ -56,53 +55,28 @@ echo
 for ((i=1; i<=TOTAL; i++)); do
     START_TS=$(now_ms)
 
-    TMPFILE=$(mktemp /tmp/run100_XXXXXX)
-
-    # executa com timeout; go run captura stdout+stderr; exit code na última linha
-    timeout "$TIMEOUT_SEC" bash -c "cd '$DIR'; go run . 2>&1; echo ___EXIT:\$?" > "$TMPFILE" 2>/dev/null
-    TIMEOUT_CODE=$?
+    timeout "$TIMEOUT_SEC" "$BIN" > /dev/null 2>&1
+    EXIT_CODE=$?
 
     END_TS=$(now_ms)
     ELAPSED=$((END_TS - START_TS))
 
-    if [[ $TIMEOUT_CODE -eq 124 ]]; then
+    if [[ $EXIT_CODE -eq 124 ]]; then
         ((TIMEOUT++))
         (( QUIET == 0 )) && printf "[%3d] ⏱  TIMEOUT\n" "$i"
-        rm -f "$TMPFILE"
         continue
     fi
 
-    # extrai exit code da última linha
-    CODE=$(grep -oP '___EXIT:\K\d+' "$TMPFILE" 2>/dev/null)
-    CODE=${CODE:-?}
-
-    # saída sem a linha ___EXIT
-    OUTPUT=$(grep -v '___EXIT:' "$TMPFILE" 2>/dev/null)
-    rm -f "$TMPFILE"
-
-    # atualiza min/max
     (( ELAPSED < MIN_MS )) && MIN_MS=$ELAPSED
     (( ELAPSED > MAX_MS )) && MAX_MS=$ELAPSED
     TOTAL_MS=$((TOTAL_MS + ELAPSED))
 
-    # sucesso: exit 0 + contém FLAG
-    IS_OK=0
-    if [[ "$CODE" == "0" ]] && echo "$OUTPUT" | grep -q "FLAG"; then
-        IS_OK=1
-    fi
-
-    if [[ $IS_OK -eq 1 ]]; then
+    if [[ $EXIT_CODE -eq 0 ]]; then
         ((OK++))
-        if (( QUIET == 0 )); then
-            FLAG_LINE=$(echo "$OUTPUT" | grep "FLAG" | head -1 | tr -d '\n\r')
-            printf "[%3d] ✓ OK  (%4dms)  %s\n" "$i" "$ELAPSED" "$FLAG_LINE"
-        fi
+        (( QUIET == 0 )) && printf "[%3d] ✓ OK  (%4dms)\n" "$i" "$ELAPSED"
     else
         ((FAIL++))
-        if (( QUIET == 0 )); then
-            LAST_FEW=$(echo "$OUTPUT" | tail -3 | tr '\n' '|' | head -c 120)
-            printf "[%3d] ✗ FAIL (%4dms)  code=%s\n       %s\n" "$i" "$ELAPSED" "$CODE" "$LAST_FEW"
-        fi
+        (( QUIET == 0 )) && printf "[%3d] ✗ FAIL (%4dms)  exit=%d\n" "$i" "$ELAPSED" "$EXIT_CODE"
     fi
 done
 
