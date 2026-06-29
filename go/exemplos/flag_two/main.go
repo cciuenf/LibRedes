@@ -83,6 +83,21 @@ const (
 //      o []byte anterior). Pense: por que o CRC-32 precisa ser recalculado?
 //
 //
-// DICA: teste com run100.sh. Sem retransmissão você vai ver ~10-15% de
-// falhas. Com retransmissão, deve chegar a 100%.
+// AVALIAÇÃO:
+//
+//   Para testar, compile seu programa e use o script run100.sh que está
+//   na raiz do repositório. Ele executa o binário 100 vezes e mostra
+//   quantas passaram. A forma de compilar e rodar depende da sua
+//   linguagem, mas o script só precisa do caminho do executável:
+//
+//     ./run100.sh -q ./seu_programa
+//
+//   Seu programa DEVE retornar exit code 0 em caso de sucesso (flag
+//   capturada) e um valor diferente de zero em caso de falha (timeout,
+//   erro de protocolo, etc.). Caso contrário o script não funcionará.
+//   O programa possuir os retornos esperados nas situações específicas
+//   é parte da avaliação.
+//
+//   Sem retransmissão você vai ver ~85-90% de sucesso. Com retransmissão
+//   implementada corretamente, deve chegar a 100%.
 
